@@ -238,7 +238,26 @@ def seed_database(force_refresh: bool = False):
     rebuilt = traj_engine.rebuild_all_trajectories()
     print(f"Successfully generated {len(rebuilt)} Reconstructed Vehicle Trajectories.")
 
-    # Generate initial alerts for speed anomalies and blacklisted detections
+    # Generate initial alerts for speed anomalies, blacklisted detections, and geofence zones
+    try:
+        from backend.services.alert_service import AlertService
+        alert_svc = AlertService(session)
+        speed_alerts = alert_svc.check_speed_anomalies(threshold_kmh=75.0)
+        print(f"Generated {len(speed_alerts)} Speed Anomaly Alert(s).")
+
+        # Also check blacklist sightings
+        for bv in blacklisted:
+            recent_ev = session.query(PlateEvent).filter(PlateEvent.plate_text == bv["plate"]).order_by(PlateEvent.timestamp.desc()).first()
+            if recent_ev:
+                alert_svc.create_alert(
+                    alert_type="FLAGGED_VEHICLE",
+                    severity="CRITICAL",
+                    message=f"🚨 BLACKLISTED VEHICLE DETECTED - Plate: {bv['plate']}, Camera: {recent_ev.camera.name} ({recent_ev.camera.location_name}), Time: {recent_ev.timestamp.strftime('%H:%M:%S')}, Reason: {bv['reason']}",
+                    plate_text=bv["plate"],
+                    camera_id=recent_ev.camera_id
+                )
+        print("Generated initial Blacklist Alert.")
+
         # Seed Smart City Geofence Zones
         from database.models import GeofenceZone
         existing_zones = session.query(GeofenceZone).count()
