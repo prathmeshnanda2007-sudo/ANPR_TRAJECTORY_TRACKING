@@ -46,6 +46,9 @@ class PlateEvent(Base):
     make_model = Column(String(100), default='Sedan')
     direction = Column(String(50), default='Northbound')
     speed_estimate_kmh = Column(Float, nullable=True)
+    is_provisional = Column(Integer, default=0)  # 1 if occluded/low-confidence fallback
+    provisional_id = Column(String(50), nullable=True)
+    resolved_plate = Column(String(20), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     
     camera = relationship("Camera", back_populates="events")
@@ -65,7 +68,10 @@ class PlateEvent(Base):
             "vehicle_type": self.vehicle_type,
             "vehicle_color": self.vehicle_color or "White",
             "make_model": self.make_model or "Sedan",
-            "speed_estimate_kmh": round(self.speed_estimate_kmh, 1) if self.speed_estimate_kmh else None
+            "speed_estimate_kmh": round(self.speed_estimate_kmh, 1) if self.speed_estimate_kmh else None,
+            "is_provisional": bool(self.is_provisional),
+            "provisional_id": self.provisional_id,
+            "resolved_plate": self.resolved_plate
         }
 
 
@@ -159,8 +165,11 @@ class GeofenceZone(Base):
     name = Column(String(255), nullable=False)
     polygon_json = Column(Text, nullable=False, default='[]')  # JSON array of [lat, lng] pairs
     color = Column(String(20), default='#f43f5e')
-    zone_type = Column(String(50), default='restricted')  # restricted, monitoring, checkpoint
+    zone_type = Column(String(50), default='restricted')  # restricted, school_zone, curfew, monitoring
     active = Column(Integer, default=1)  # SQLite boolean
+    curfew_start = Column(String(10), nullable=True)  # e.g. "22:00"
+    curfew_end = Column(String(10), nullable=True)    # e.g. "05:00"
+    speed_limit = Column(Float, nullable=True)        # e.g. 30.0 for school zones
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     @property
@@ -182,6 +191,9 @@ class GeofenceZone(Base):
             "color": self.color,
             "zone_type": self.zone_type,
             "active": bool(self.active),
+            "curfew_start": self.curfew_start,
+            "curfew_end": self.curfew_end,
+            "speed_limit": self.speed_limit,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
@@ -282,6 +294,27 @@ def init_db(engine=None):
                     conn.commit()
                 if "make_model" not in columns:
                     conn.execute(text("ALTER TABLE plate_events ADD COLUMN make_model VARCHAR(100) DEFAULT 'Sedan'"))
+                    conn.commit()
+                if "is_provisional" not in columns:
+                    conn.execute(text("ALTER TABLE plate_events ADD COLUMN is_provisional INTEGER DEFAULT 0"))
+                    conn.commit()
+                if "provisional_id" not in columns:
+                    conn.execute(text("ALTER TABLE plate_events ADD COLUMN provisional_id VARCHAR(50)"))
+                    conn.commit()
+                if "resolved_plate" not in columns:
+                    conn.execute(text("ALTER TABLE plate_events ADD COLUMN resolved_plate VARCHAR(20)"))
+                    conn.commit()
+
+            if "geofence_zones" in tables:
+                geo_cols = [c["name"] for c in inspector.get_columns("geofence_zones")]
+                if "curfew_start" not in geo_cols:
+                    conn.execute(text("ALTER TABLE geofence_zones ADD COLUMN curfew_start VARCHAR(10)"))
+                    conn.commit()
+                if "curfew_end" not in geo_cols:
+                    conn.execute(text("ALTER TABLE geofence_zones ADD COLUMN curfew_end VARCHAR(10)"))
+                    conn.commit()
+                if "speed_limit" not in geo_cols:
+                    conn.execute(text("ALTER TABLE geofence_zones ADD COLUMN speed_limit FLOAT"))
                     conn.commit()
     except Exception as e:
         print(f"[DB Migration Warning] Column auto-migration check: {e}")

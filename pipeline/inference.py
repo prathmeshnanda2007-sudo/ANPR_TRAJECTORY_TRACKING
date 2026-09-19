@@ -234,15 +234,22 @@ class SingleImagePipeline:
                 is_valid = self.validator.is_valid(cleaned_text)
                 rto_info = self.validator.get_rto_details(cleaned_text)
 
-                print(f"    Plate {p_idx+1}: OCR='{cleaned_text}', Conf={conf:.2f}, Valid={is_valid}")
+                # Fallback Re-ID: If OCR is unreadable or low confidence, generate provisional ID with coarse fingerprint
+                is_provisional = (not is_valid) or (cleaned_text in ["UNREADABLE", ""]) or (conf < 0.48)
+                provisional_id = f"UNVERIFIED-#{random.randint(100, 999)}" if is_provisional else None
+                final_text = cleaned_text if (is_valid and cleaned_text != "UNREADABLE") else (provisional_id or "UNREADABLE")
+
+                print(f"    Plate {p_idx+1}: OCR='{cleaned_text}', Conf={conf:.2f}, Valid={is_valid}, Provisional={is_provisional}")
 
                 abs_bbox = [vx1 + px1, vy1 + py1, vx1 + px2, vy1 + py2]
                 results.append({
                     'vehicle_idx': idx,
                     'plate_idx': p_idx,
-                    'text': cleaned_text or "UNREADABLE",
+                    'text': final_text,
                     'confidence': round(float(conf), 3),
-                    'is_valid': is_valid,
+                    'is_valid': is_valid or is_provisional,
+                    'is_provisional': is_provisional,
+                    'provisional_id': provisional_id,
                     'rto_details': rto_info,
                     'vehicle_type': v_type,
                     'vehicle_color': v_color,

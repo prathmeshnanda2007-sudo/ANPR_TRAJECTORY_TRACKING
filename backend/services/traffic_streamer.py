@@ -2,12 +2,16 @@
 Autonomous Real-Time City Traffic Streamer Engine.
 Continuously simulates real vehicle movements and ANPR detections across the smart city
 camera network, persisting sightings to the database and broadcasting over WebSockets.
+Includes:
+- Speed-zone anomaly checks & alerts
+- Geofenced zone & curfew evaluations
+- Provisional Fallback Re-ID for occluded plates with downstream confirmation upgrades
 """
 
 import asyncio
 import datetime
 import random
-from typing import List, Dict
+from typing import List, Dict, Optional, Tuple
 from database.models import get_session, Camera, PlateEvent, Trajectory
 from analytics.trajectory import TrajectoryEngine
 from backend.services.alert_service import AlertService
@@ -34,7 +38,7 @@ CORRIDOR_CAMERAS = [
     [4, 8, 9, 10]
 ]
 
-# Dedicated ambient fleet for live simulation to ensure tracked vehicles retain distinct, clean trajectories
+# Dedicated ambient fleet for live simulation
 STREAM_COMMUTER_PLATES = [
     {"plate": "OD02TR1011", "type": "Car", "color": "Silver", "make": "Sedan"},
     {"plate": "OD02CV4455", "type": "Car", "color": "White", "make": "SUV"},
@@ -67,8 +71,9 @@ JUNCTION_SPEED_PROFILES = {
     12: (30.0, 38.0), # Baramunda: Bus terminal
 }
 
+
 class ActiveVehicleJourney:
-    def __init__(self, plate_info: dict, corridor: List[int]):
+    def __init__(self, plate_info: dict, corridor: List[int], start_provisional: bool = False):
         self.plate = plate_info["plate"]
         self.v_type = plate_info["type"]
         self.color = plate_info.get("color", "White")
@@ -76,8 +81,10 @@ class ActiveVehicleJourney:
         self.corridor = corridor
         self.current_step = 0
         self.completed = False
+        self.is_provisional = start_provisional
+        self.provisional_id = f"UNVERIFIED-#{random.randint(10, 99)}" if start_provisional else None
 
-    def next_camera_id(self) -> int:
+    def next_camera_id(self) -> Optional[int]:
         if self.current_step < len(self.corridor):
             cam_id = self.corridor[self.current_step]
             self.current_step += 1
@@ -86,6 +93,7 @@ class ActiveVehicleJourney:
             return cam_id
         self.completed = True
         return None
+
 
 class CityTrafficStreamEngine:
     def __init__(self, interval_seconds: float = 3.5):
@@ -96,10 +104,12 @@ class CityTrafficStreamEngine:
         self._seed_active_journeys()
 
     def _seed_active_journeys(self):
-        for plate_info in STREAM_COMMUTER_PLATES[:8]:
+        for idx, plate_info in enumerate(STREAM_COMMUTER_PLATES[:8]):
             corridor = random.choice(CORRIDOR_CAMERAS)
-            journey = ActiveVehicleJourney(plate_info, corridor)
-            journey.current_step = random.randint(0, len(corridor) - 1)
+            # Make 1 vehicle start as occluded/provisional for immediate live demonstration
+            start_prov = (idx == 2)
+            journey = ActiveVehicleJourney(plate_info, corridor, start_provisional=start_prov)
+            journey.current_step = random.randint(0, len(corridor) - 1) if not start_prov else 0
             self._active_journeys.append(journey)
 
     async def start(self):
@@ -137,35 +147,68 @@ class CityTrafficStreamEngine:
         if len(self._active_journeys) < 6:
             plate_info = random.choice(STREAM_COMMUTER_PLATES)
             corridor = random.choice(CORRIDOR_CAMERAS)
-            self._active_journeys.append(ActiveVehicleJourney(plate_info, corridor))
+            # 1 in 5 new journeys will start with an occluded plate / fallback ID
+            start_prov = (random.random() < 0.25)
+            self._active_journeys.append(ActiveVehicleJourney(plate_info, corridor, start_provisional=start_prov))
 
         if not self._active_journeys:
             return
 
         journey = random.choice(self._active_journeys)
+        step_number = journey.current_step
         cam_id = journey.next_camera_id()
         if not cam_id:
             return
 
-        # Offload synchronous SQLite operations to threadpool so asyncio loop stays 100% responsive
+        # Check provisional status:
+        # If journey was provisional and this is step >= 1, vehicle is cleanly identified at downstream camera!
+        resolving_provisional_id = None
+        current_plate_to_report = journey.plate
+        current_is_provisional = False
+        current_provisional_id = None
+
+        if journey.is_provisional:
+            if step_number == 0:
+                # First sighting: Occluded / muddy plate, fallback coarse fingerprint
+                current_plate_to_report = journey.provisional_id
+                current_is_provisional = True
+                current_provisional_id = journey.provisional_id
+            else:
+                # Downstream camera gets clean read! Re-ID resolved
+                resolving_provisional_id = journey.provisional_id
+                journey.is_provisional = False
+                journey.provisional_id = None
+                current_plate_to_report = journey.plate
+
+        # Offload synchronous SQLite operations to threadpool
         try:
             result = await asyncio.to_thread(
                 self._sync_record_sighting,
                 cam_id,
-                journey.plate,
+                current_plate_to_report,
                 journey.v_type,
                 journey.color,
-                journey.make
+                journey.make,
+                current_is_provisional,
+                current_provisional_id,
+                resolving_provisional_id
             )
             if not result:
                 return
 
-            event_dict, alerts_to_broadcast = result
+            event_dict, alerts_to_broadcast, reid_upgrade = result
 
             # Broadcast alerts
             for alert in alerts_to_broadcast:
                 try:
                     await ws_manager.broadcast_alert(alert)
+                except Exception:
+                    pass
+
+            # Broadcast Re-ID Upgrade event if resolved
+            if reid_upgrade:
+                try:
+                    await ws_manager.broadcast_reid_upgrade(reid_upgrade)
                 except Exception:
                     pass
 
@@ -178,10 +221,22 @@ class CityTrafficStreamEngine:
         except Exception as e:
             print(f"[TrafficStreamer Warning] Error in sighting processing: {e}")
 
-    def _sync_record_sighting(self, cam_id: int, plate: str, v_type: str, color: str, make: str):
+    def _sync_record_sighting(
+        self,
+        cam_id: int,
+        plate: str,
+        v_type: str,
+        color: str,
+        make: str,
+        is_provisional: bool = False,
+        provisional_id: Optional[str] = None,
+        resolving_provisional_id: Optional[str] = None
+    ) -> Optional[Tuple[dict, List[dict], Optional[dict]]]:
         """Runs synchronously in a separate threadpool worker."""
         session = get_session()
         alerts_to_broadcast = []
+        reid_upgrade = None
+
         try:
             cam = session.query(Camera).filter(Camera.id == cam_id).first()
             if not cam or cam.status != "ACTIVE":
@@ -189,8 +244,14 @@ class CityTrafficStreamEngine:
 
             min_sp, max_sp = JUNCTION_SPEED_PROFILES.get(cam.id, (35.0, 50.0))
             type_mod = -3.0 if v_type in ["Truck", "Bus"] else 0.0
-            speed = max(16.0, random.uniform(min_sp, max_sp) + type_mod)
-            conf = round(random.uniform(0.92, 0.99), 3)
+            # Occasional speeder on expressways (CAM 5, 11)
+            is_speeder = (cam_id in [5, 11] and random.random() < 0.20)
+            if is_speeder:
+                speed = random.uniform(82.0, 94.0)
+            else:
+                speed = max(16.0, random.uniform(min_sp, max_sp) + type_mod)
+
+            conf = round(random.uniform(0.38, 0.48), 2) if is_provisional else round(random.uniform(0.92, 0.99), 3)
             now = datetime.datetime.utcnow()
 
             direction = "Northbound"
@@ -201,6 +262,49 @@ class CityTrafficStreamEngine:
             elif cam_id in [1, 2, 3]:
                 direction = "Eastbound"
 
+            # 1. Handle Re-ID Upgrade resolution if vehicle was previously provisional
+            if resolving_provisional_id:
+                # Update earlier provisional events in DB to link to the confirmed plate
+                prior_events = (
+                    session.query(PlateEvent)
+                    .filter(PlateEvent.provisional_id == resolving_provisional_id)
+                    .all()
+                )
+                for pe in prior_events:
+                    pe.resolved_plate = plate
+                session.commit()
+
+                reid_msg = (
+                    f"🔄 RE-ID RESOLVED: Fallback {resolving_provisional_id} verified as "
+                    f"{plate} at {cam.name} ({color} {v_type})"
+                )
+                reid_upgrade = {
+                    "provisional_id": resolving_provisional_id,
+                    "resolved_plate": plate,
+                    "camera_id": cam.id,
+                    "camera_name": cam.name,
+                    "camera_location": cam.location_name,
+                    "vehicle_type": v_type,
+                    "vehicle_color": color,
+                    "confidence": conf,
+                    "message": reid_msg
+                }
+
+                # Record INFO alert for Re-ID resolution
+                alert_svc = AlertService(session)
+                try:
+                    res_alert = alert_svc.create_alert(
+                        alert_type="REID_RESOLUTION",
+                        severity="INFO",
+                        message=reid_msg,
+                        plate_text=plate,
+                        camera_id=cam.id
+                    )
+                    alerts_to_broadcast.append(res_alert)
+                except Exception:
+                    pass
+
+            # 2. Persist current sighting event
             event = PlateEvent(
                 camera_id=cam.id,
                 plate_text=plate,
@@ -210,7 +314,10 @@ class CityTrafficStreamEngine:
                 vehicle_color=color,
                 make_model=make,
                 direction=cam.direction or direction,
-                speed_estimate_kmh=round(speed, 1)
+                speed_estimate_kmh=round(speed, 1),
+                is_provisional=1 if is_provisional else 0,
+                provisional_id=provisional_id,
+                resolved_plate=None
             )
             session.add(event)
             session.commit()
@@ -218,17 +325,20 @@ class CityTrafficStreamEngine:
 
             event_dict = event.to_dict()
 
-            # Update trajectory
+            # 3. Update trajectory
             try:
                 traj_engine = TrajectoryEngine(session)
                 traj_engine.build_trajectories_for_plate(plate, commit=True)
+                if resolving_provisional_id:
+                    # Also rebuild for resolved plate to incorporate previous steps
+                    traj_engine.build_trajectories_for_plate(plate, commit=True)
             except Exception:
                 pass
 
-            # Alert checks
+            # 4. Alert checks
             alert_svc = AlertService(session)
 
-            # 1. Blacklist Match Alert
+            # Blacklist Match Alert
             try:
                 bl_alert = alert_svc.check_blacklist_match(plate, cam.id, cam.name)
                 if bl_alert:
@@ -236,29 +346,36 @@ class CityTrafficStreamEngine:
             except Exception:
                 pass
 
-            # 2. Suspicious Speed / Route Anomaly Alert
+            # Suspicious Speed / Route Anomaly Alert
             try:
                 sp_alert = alert_svc.check_suspicious_route(plate, cam.id, speed)
                 if sp_alert:
                     alerts_to_broadcast.append(sp_alert)
                 elif speed > 75.0:
-                    speed_alerts = alert_svc.check_speed_anomalies()
+                    speed_alerts = alert_svc.check_speed_anomalies(threshold_kmh=75.0)
                     for sa in speed_alerts:
                         alerts_to_broadcast.append(sa)
             except Exception:
                 pass
 
-            # 3. Check geofences
+            # Geofence checks with point-in-polygon and speed limits
             try:
                 geo_svc = GeofenceService(session)
-                geo_alerts = geo_svc.check_point_in_geofences(cam.latitude, cam.longitude, plate, cam.id)
+                geo_alerts = geo_svc.check_point_in_geofences(
+                    lat=cam.latitude,
+                    lng=cam.longitude,
+                    plate_text=plate,
+                    camera_id=cam.id,
+                    speed=speed,
+                    timestamp=now
+                )
                 if geo_alerts:
                     for ga in geo_alerts:
                         alerts_to_broadcast.append(ga)
             except Exception:
                 pass
 
-            return event_dict, alerts_to_broadcast
+            return event_dict, alerts_to_broadcast, reid_upgrade
 
         finally:
             session.close()

@@ -15,13 +15,17 @@ class CreateGeofenceRequest(BaseModel):
     name: str
     polygon: List[List[float]]  # list of [lat, lng] pairs
     color: str = "#f43f5e"
-    zone_type: str = "restricted"  # restricted, monitoring, checkpoint
+    zone_type: str = "restricted"  # restricted, school_zone, curfew, monitoring
+    curfew_start: Optional[str] = None
+    curfew_end: Optional[str] = None
+    speed_limit: Optional[float] = None
 
 
 class CheckPointRequest(BaseModel):
     latitude: float
     longitude: float
     plate_text: Optional[str] = None
+    speed_kmh: Optional[float] = None
 
 
 @router.post("/check-point")
@@ -71,6 +75,9 @@ def create_geofence(req: CreateGeofenceRequest):
             polygon_coords=req.polygon,
             color=req.color,
             zone_type=req.zone_type,
+            curfew_start=req.curfew_start,
+            curfew_end=req.curfew_end,
+            speed_limit=req.speed_limit,
         )
     finally:
         session.close()

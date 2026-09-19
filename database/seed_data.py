@@ -239,26 +239,64 @@ def seed_database(force_refresh: bool = False):
     print(f"Successfully generated {len(rebuilt)} Reconstructed Vehicle Trajectories.")
 
     # Generate initial alerts for speed anomalies and blacklisted detections
-    try:
-        from backend.services.alert_service import AlertService
-        alert_svc = AlertService(session)
-        speed_alerts = alert_svc.check_speed_anomalies(threshold_kmh=75.0)
-        print(f"Generated {len(speed_alerts)} Speed Anomaly Alert(s).")
-        
-        # Also check blacklist sightings
-        for bv in blacklisted:
-            recent_ev = session.query(PlateEvent).filter(PlateEvent.plate_text == bv["plate"]).order_by(PlateEvent.timestamp.desc()).first()
-            if recent_ev:
-                alert_svc.create_alert(
-                    alert_type="FLAGGED_VEHICLE",
-                    severity="CRITICAL",
-                    message=f"🚨 BLACKLISTED VEHICLE DETECTED - Plate: {bv['plate']}, Camera: {recent_ev.camera.name} ({recent_ev.camera.location_name}), Time: {recent_ev.timestamp.strftime('%H:%M:%S')}, Reason: {bv['reason']}",
-                    plate_text=bv["plate"],
-                    camera_id=recent_ev.camera_id
-                )
-        print("Generated initial Blacklist Alert.")
+        # Seed Smart City Geofence Zones
+        from database.models import GeofenceZone
+        existing_zones = session.query(GeofenceZone).count()
+        if existing_zones == 0:
+            default_zones = [
+                {
+                    "name": "Secretariat VIP Security Corridor",
+                    "polygon": [[20.2620, 85.8380], [20.2720, 85.8390], [20.2710, 85.8490], [20.2610, 85.8470]],
+                    "color": "#f43f5e",
+                    "zone_type": "restricted",
+                    "curfew_start": None,
+                    "curfew_end": None,
+                    "speed_limit": None
+                },
+                {
+                    "name": "DAV Public School Safe Zone",
+                    "polygon": [[20.2970, 85.8190], [20.3070, 85.8210], [20.3080, 85.8380], [20.2960, 85.8360]],
+                    "color": "#38bdf8",
+                    "zone_type": "school_zone",
+                    "curfew_start": "07:00",
+                    "curfew_end": "16:00",
+                    "speed_limit": 30.0
+                },
+                {
+                    "name": "Infocity High-Tech Curfew Zone",
+                    "polygon": [[20.3480, 85.8080], [20.3620, 85.8100], [20.3600, 85.8250], [20.3460, 85.8230]],
+                    "color": "#a855f7",
+                    "zone_type": "curfew",
+                    "curfew_start": "22:00",
+                    "curfew_end": "05:00",
+                    "speed_limit": None
+                }
+            ]
+            import json
+            for gz in default_zones:
+                session.add(GeofenceZone(
+                    name=gz["name"],
+                    polygon_json=json.dumps(gz["polygon"]),
+                    color=gz["color"],
+                    zone_type=gz["zone_type"],
+                    curfew_start=gz["curfew_start"],
+                    curfew_end=gz["curfew_end"],
+                    speed_limit=gz["speed_limit"],
+                    active=1,
+                    created_at=datetime.datetime.utcnow()
+                ))
+            session.commit()
+            print("Seeded 3 Default Smart City Geofence Zones.")
+
+            # Seed an initial geofence breach alert
+            from backend.services.geofence_service import GeofenceService
+            geo_svc = GeofenceService(session)
+            geo_alerts = geo_svc.check_point_in_geofences(
+                lat=20.2667, lng=85.8436, plate_text="OD02AB1234", camera_id=6
+            )
+            print(f"Generated {len(geo_alerts)} initial Geofence Breach Alert(s).")
     except Exception as ae:
-        print(f"Alert generation error: {ae}")
+        print(f"Alert/Geofence generation error: {ae}")
 
     session.close()
 

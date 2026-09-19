@@ -64,6 +64,17 @@ def get_speed_anomalies():
     finally:
         session.close()
 
+@router.get("/speed-violations-heatmap")
+def get_speed_violations_heatmap(threshold_kmh: float = Query(75.0, description="Speed violation threshold in km/h")):
+    """Get live-updating road segment speed violation choropleth and hotspot matrix."""
+    from analytics.speed_heatmap import SpeedViolationHeatmapEngine
+    session = get_session()
+    try:
+        engine = SpeedViolationHeatmapEngine(session)
+        return engine.get_speed_violation_segments(threshold_kmh=threshold_kmh)
+    finally:
+        session.close()
+
 # ── New Analytics Endpoints ──
 
 @router.get("/heatmap")

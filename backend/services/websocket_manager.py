@@ -74,6 +74,17 @@ class ConnectionManager:
         await self.broadcast("alerts", msg)
         await self.broadcast("live", msg)
 
+    async def broadcast_reid_upgrade(self, reid_data: dict):
+        """Broadcast a vehicle provisional Re-ID upgrade event."""
+        msg = {
+            "type": "provisional_upgraded",
+            "timestamp": datetime.datetime.utcnow().isoformat(),
+            "data": reid_data,
+        }
+        await self.broadcast("live-feed", msg)
+        await self.broadcast("live", msg)
+        await self.broadcast("alerts", msg)
+
     def get_connection_count(self, channel: str = None) -> int:
         """Returns the number of active connections, optionally filtered by channel."""
         if channel:
